@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"sync"
 
 	"github.com/gorilla/websocket"
 )
@@ -14,6 +15,10 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
+var clients = make(map[*websocket.Conn]bool) // Connected clients
+var broadcast = make(chan []byte)            // Broadcast channel
+var mutex = &sync.Mutex{}                    // Protect clients map
+
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	// Upgrade the HTTP connection to a WebSocket connection
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -22,32 +27,46 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Listen for incoming messages concurrently
-   go handleConnection(conn)
+	defer conn.Close()
+
+	mutex.Lock()
+	clients[conn] = true
+	mutex.Unlock()
+
+	for {
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			mutex.Lock()
+			delete(clients, conn)
+			mutex.Unlock()
+			break
+		}
+		broadcast <- message
+	}
 
 }
 
-func handleConnection(conn *websocket.Conn) {
-   defer conn.Close()
-
+func handleMessages() {
 	for {
-		// Read message from the client
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			fmt.Println("Error reading message:", err)
-			break
+		// Grab the next message from the broadcast channel
+		message := <-broadcast
+
+		// Send the message to all connected clients
+		mutex.Lock()
+		for client := range clients {
+			err := client.WriteMessage(websocket.TextMessage, message)
+			if err != nil {
+				client.Close()
+				delete(clients, client)
+			}
 		}
-		fmt.Printf("Received: %s\\n", message)
-		// Echo the message back to the client
-		if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
-			fmt.Println("Error writing message:", err)
-			break
-		}
+		mutex.Unlock()
 	}
 }
 
 func main() {
 	http.HandleFunc("/ws", wsHandler)
+	go handleMessages()
 	fmt.Println("WebSocket server started on :8080")
 	err := http.ListenAndServe(":8080", nil)
 	if err != nil {
